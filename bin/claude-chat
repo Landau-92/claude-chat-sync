@@ -1,0 +1,784 @@
+#!/usr/bin/python3 -I
+"""claude-chat: compare, copy and move Claude Code chats between Claude profiles on macOS.
+
+A "profile" is one Claude Desktop data folder plus one Claude Code config folder:
+the default install (~/Library/Application Support/Claude + ~/.claude) and every
+profile made with claude-multiprofile that has both a Desktop and a Code half.
+
+  claude-chat profiles [--json]
+  claude-chat list   --from P [TEXT] [--json]
+  claude-chat status [--profiles P,Q,R] [--json]
+  claude-chat copy   CHAT --from P --to Q [--move | --archive-source] [--solo] [--force] [--dry-run] [--json]
+  claude-chat trash  list [--json] | restore ID
+  claude-chat pending list [--json] | cancel SESSION_ID
+
+A chat is the card in the Desktop Code tab (claude-code-sessions/<account>/<org>/local_*.json),
+its transcripts (<config>/projects/<folder>/<cli id>.jsonl and folder), its checkpoints
+(<config>/file-history/<cli id>/) and, for multi-session work, the shared notes folder
+(<data>/side-session-notes/<session id>/). `copy` takes a chat together with all its
+sub-chats unless --solo is given, and can be run again to bring a copy up to date.
+
+Writing into a profile needs its Claude app closed. Archiving or removing chats in a
+profile whose app is open is queued and applied as soon as that app is closed (on the
+next claude-chat command). Removed chats go to a trash folder and can be restored.
+
+These are internal, undocumented Claude formats: keep backups, and expect to update
+this tool when Claude changes them.
+"""
+import argparse, glob, json, os, shutil, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+SUPPORT = os.path.join(HOME, "Library/Application Support")
+MULTIPROFILE_REGISTRY = os.path.join(HOME, ".config/claude-multiprofile/profiles.json")
+CONFIG_DIR = os.path.join(HOME, ".config/claude-chat-sync")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+PENDING_FILE = os.path.join(CONFIG_DIR, "pending.json")
+DATA_DIR = os.path.join(HOME, ".local/share/claude-chat-sync")
+TRASH_DIR = os.path.join(DATA_DIR, "trash")
+COMPARE_CACHE = os.path.join(HOME, ".cache/claude-chat-sync/compare.json")
+
+# Fields that point at the source account or app instance: never copied across
+DROP_KEYS = ("bridgeSessionIds", "chromeTabGroupId", "remoteMcpServersConfig")
+TS = time.strftime("%Y%m%d-%H%M%S")
+
+# Exit codes read by the app
+EXIT_APP_OPEN, EXIT_DIVERGED, EXIT_DEST_AHEAD = 3, 4, 5
+
+
+class ToolError(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.msg, self.code = msg, code
+
+
+def die(msg, code=1):
+    raise ToolError(msg, code)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path, d):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- profiles
+
+def load_profiles():
+    """Every usable profile, in order: default first, then claude-multiprofile, then config.json."""
+    cfg = read_json(CONFIG_FILE, {}) or {}
+    names = cfg.get("names", {})
+    out = [{
+        "key": "default", "data": os.path.join(SUPPORT, "Claude"), "cfg": os.path.join(HOME, ".claude"),
+        "account_json": os.path.join(HOME, ".claude.json"), "udd": None, "color": None,
+    }]
+    reg = read_json(MULTIPROFILE_REGISTRY, {}) or {}
+    for p in reg.get("profiles", []):
+        desk, code = p.get("desktop") or {}, p.get("code") or {}
+        if not desk.get("dataDir") or not code.get("configDir"):
+            continue  # Desktop-only or Code-only profiles have no chats to move here
+        out.append({
+            "key": p["name"], "data": desk["dataDir"], "cfg": code["configDir"],
+            "account_json": os.path.join(code["configDir"], ".claude.json"),
+            "udd": desk["dataDir"], "color": desk.get("color"),
+        })
+    for p in cfg.get("profiles", []):  # hand-made setups without claude-multiprofile
+        if p.get("key") and p.get("dataDir") and p.get("configDir") and all(x["key"] != p["key"] for x in out):
+            out.append({
+                "key": p["key"], "data": os.path.expanduser(p["dataDir"]), "cfg": os.path.expanduser(p["configDir"]),
+                "account_json": os.path.join(os.path.expanduser(p["configDir"]), ".claude.json"),
+                "udd": os.path.expanduser(p["dataDir"]), "color": p.get("color"),
+            })
+    for p in out:
+        p["name"] = names.get(p["key"], p["key"].capitalize() if p["key"] != "default" else "Default")
+    return out
+
+
+PROFILES = {p["key"]: p for p in load_profiles()}
+
+
+def profile(key):
+    if key not in PROFILES:
+        die(f"unknown profile '{key}'. Known: {', '.join(PROFILES)}")
+    return PROFILES[key]
+
+
+_ps_cache = None
+
+
+def app_running(key):
+    """Is this profile's Claude Desktop open? The default one runs without --user-data-dir."""
+    global _ps_cache
+    if _ps_cache is None:
+        fake = os.environ.get("CLAUDE_CHAT_PS_OUTPUT")  # tests: the process list to pretend
+        _ps_cache = (fake if fake is not None else
+                     subprocess.run(["ps", "-axww", "-o", "args="], capture_output=True, text=True).stdout).splitlines()
+    udd = PROFILES[key]["udd"]
+    for line in _ps_cache:
+        if "/Contents/MacOS/Claude" not in line or "--type=" in line:
+            continue
+        if udd is None and "--user-data-dir=" not in line:
+            return True
+        if udd is not None and f"--user-data-dir={udd}" in line:
+            return True
+    return False
+
+
+def account_info(key):
+    """The account Claude Desktop is signed in with, and the e-mail Claude Code knows for it."""
+    p = PROFILES[key]
+    app_acct = (read_json(os.path.join(p["data"], "config.json"), {}) or {}).get("lastKnownAccountUuid")
+    oauth = (read_json(p["account_json"], {}) or {}).get("oauthAccount") or {}
+    code_acct, email = oauth.get("accountUuid"), oauth.get("emailAddress")
+    return {
+        "account": app_acct,
+        "email": email if code_acct and code_acct == app_acct else None,
+        "codeEmail": email,
+        # Desktop and Code signed in with different accounts: chats would land in the wrong place
+        "accountMismatch": bool(app_acct and code_acct and app_acct != code_acct),
+    }
+
+
+def sessions_dir(key):
+    """Folder of the Code tab cards for the account this profile's Desktop is signed in with."""
+    data = PROFILES[key]["data"]
+    acct = account_info(key)["account"]
+    if not acct:
+        die(f"profile {key}: Claude Desktop is not signed in ({data}/config.json)")
+    orgs = [d for d in glob.glob(os.path.join(data, "claude-code-sessions", acct, "*")) if os.path.isdir(d)]
+    if not orgs:
+        die(f"profile {key}: no Code sessions for account {acct[:8]} yet. Open the Code tab once.")
+
+    # Several organisations for one account: the one used most recently
+    def last_use(d):
+        files = glob.glob(os.path.join(d, "*"))
+        return (max((os.path.getmtime(f) for f in files), default=0), len(files))
+    return max(orgs, key=last_use)
+
+
+# ---------------------------------------------------------------- chats
+
+def load_records(key):
+    out = []
+    for f in glob.glob(os.path.join(sessions_dir(key), "local_*.json")):
+        d = read_json(f)
+        if d and d.get("sessionId"):
+            d["_file"] = f
+            out.append(d)
+    return sorted(out, key=lambda d: d.get("lastActivityAt") or 0, reverse=True)
+
+
+def project_dir(cfg, cwd):
+    return os.path.join(cfg, "projects", "".join(c if c.isalnum() else "-" for c in cwd))
+
+
+def scratch_root():
+    return os.path.join(SUPPORT, "Claude", "scratch-workspaces")
+
+
+def project_of(cwd):
+    """The project folder: Claude worktrees count as their repository; scratch folders as none."""
+    if not cwd or "/scratch-workspaces/" in cwd:
+        return ""
+    marker = "/.claude/worktrees/"
+    return cwd.split(marker)[0] if marker in cwd else cwd
+
+
+def parent_of(rec):
+    """The chat a sub-chat was started from, unless the user detached it."""
+    if rec.get("lineageDetached"):
+        return None
+    return (rec.get("spawnedFrom") or {}).get("sessionId")
+
+
+def family(records, root):
+    """The chat and all its sub-chats, at any depth, in tree order."""
+    kids = {}
+    for r in records:
+        kids.setdefault(parent_of(r), []).append(r)
+    out, todo = [], [(root, 0)]
+    while todo:
+        r, depth = todo.pop(0)
+        out.append((r, depth))
+        todo[0:0] = [(k, depth + 1) for k in kids.get(r["sessionId"], [])]
+    return out
+
+
+def cli_ids(rec):
+    first = rec.get("cliSessionId")
+    return ([first] if first else []) + [c for c in rec.get("priorCliSessionIds") or [] if c != first]
+
+
+def transcript(key, rec):
+    if not rec.get("cliSessionId") or not rec.get("cwd"):
+        return None
+    return os.path.join(project_dir(PROFILES[key]["cfg"], rec["cwd"]), rec["cliSessionId"] + ".jsonl")
+
+
+def read_idx(sess_dir):
+    return set((read_json(os.path.join(sess_dir, "archived-sessions.idx"), {}) or {}).get("archived", []))
+
+
+def set_archived_idx(sess_dir, session_id, archived):
+    idx = os.path.join(sess_dir, "archived-sessions.idx")
+    d = read_json(idx)
+    if d is None:
+        return
+    lst = d.get("archived", [])
+    new = (lst if session_id in lst else lst + [session_id]) if archived else [x for x in lst if x != session_id]
+    if new != lst:
+        d["archived"] = new
+        write_json(idx, d)
+
+
+def is_archived(rec, idx):
+    return bool(rec.get("isArchived")) or rec["sessionId"] in idx
+
+
+def find(records, query):
+    q = query.lower().removeprefix("local_")
+    hits = [r for r in records if q in r["sessionId"].lower() or q in (r.get("cliSessionId") or "").lower()]
+    if not hits:
+        hits = [r for r in records if q in (r.get("title") or "").lower()]
+    if len(hits) != 1:
+        if hits:
+            print("Several chats match, use the ID:", file=sys.stderr)
+            for r in hits:
+                print(f"  {r['sessionId'][6:14]}  {r.get('title')}", file=sys.stderr)
+        die(f"no single chat matches '{query}'")
+    return hits[0]
+
+
+# ---------------------------------------------------------------- comparing
+
+def prefix_equal(pa, pb, n):
+    with open(pa, "rb") as fa, open(pb, "rb") as fb:
+        left = n
+        while left > 0:
+            k = min(left, 1 << 20)
+            if fa.read(k) != fb.read(k):
+                return False
+            left -= k
+    return True
+
+
+def compare(pa, pb, cache=None):
+    """State of a against b: same, newer (a is further along), older, diverged, missing."""
+    if not pa or not pb or not os.path.exists(pa) or not os.path.exists(pb):
+        return "missing"
+    sa, sb = os.stat(pa), os.stat(pb)
+    key = f"{pa}|{sa.st_size}|{sa.st_mtime_ns}|{pb}|{sb.st_size}|{sb.st_mtime_ns}"
+    if cache is not None and key in cache:
+        return cache[key]
+    if not prefix_equal(pa, pb, min(sa.st_size, sb.st_size)):
+        res = "diverged"
+    elif sa.st_size == sb.st_size:
+        res = "same"
+    else:
+        res = "newer" if sa.st_size > sb.st_size else "older"
+    if cache is not None:
+        cache[key] = res
+    return res
+
+
+# ---------------------------------------------------------------- queued actions
+
+def load_pending():
+    return read_json(PENDING_FILE, []) or []
+
+
+def save_pending(items):
+    write_json(PENDING_FILE, items)
+
+
+def queue(action, key, rec, dest=None):
+    items = [it for it in load_pending() if not (it["sessionId"] == rec["sessionId"] and it["profile"] == key)]
+    items.append({"action": action, "profile": key, "sessionId": rec["sessionId"], "dest": dest,
+                  "title": rec.get("title"), "queuedAt": int(time.time() * 1000)})
+    save_pending(items)
+
+
+def archive_now(key, rec):
+    d = read_json(rec["_file"])
+    if d is None:
+        return
+    d["isArchived"] = True
+    write_json(rec["_file"], d)
+    set_archived_idx(os.path.dirname(rec["_file"]), rec["sessionId"], True)
+
+
+def apply_pending():
+    """Apply queued archives and removals for profiles whose app is now closed."""
+    items = load_pending()
+    if not items:
+        return
+    left = []
+    for it in items:
+        if it["profile"] not in PROFILES or app_running(it["profile"]):
+            left.append(it)
+            continue
+        try:
+            recs = {r["sessionId"]: r for r in load_records(it["profile"])}
+        except ToolError:
+            left.append(it)
+            continue
+        rec = recs.get(it["sessionId"])
+        if not rec:
+            continue  # already gone
+        if it["action"] == "archive":
+            archive_now(it["profile"], rec)
+        elif it["action"] == "remove" and it.get("dest") in PROFILES:
+            # Only if the copy is still identical: the chat may have been continued meanwhile
+            if synced_with(rec, it["profile"], it["dest"]):
+                trash_chat(it["profile"], rec)
+    if left != items:
+        save_pending(left)
+
+
+# ---------------------------------------------------------------- trash
+
+def synced_with(rec, src, dst):
+    """Is every transcript of this chat present and identical in the destination profile?"""
+    if not rec.get("cwd") or not cli_ids(rec):
+        return False
+    sp, dp = project_dir(PROFILES[src]["cfg"], rec["cwd"]), project_dir(PROFILES[dst]["cfg"], rec["cwd"])
+    for cli in cli_ids(rec):
+        a, b = os.path.join(sp, cli + ".jsonl"), os.path.join(dp, cli + ".jsonl")
+        if os.path.exists(a) and compare(a, b) != "same":
+            return False
+    try:
+        return os.path.exists(os.path.join(sessions_dir(dst), os.path.basename(rec["_file"])))
+    except ToolError:
+        return False
+
+
+def trash_chat(key, rec):
+    """Take a chat out of a profile the way Claude does (card gone, tombstone left), keeping the files."""
+    p = PROFILES[key]
+    sess = os.path.dirname(rec["_file"])
+    entry = os.path.join(TRASH_DIR, f"{time.strftime('%Y%m%d-%H%M%S')}-{key}-{rec['sessionId'][6:14]}")
+    os.makedirs(entry, exist_ok=True)
+    moves = []
+
+    def move(src):
+        if os.path.exists(src):
+            dst = os.path.join(entry, "files", str(len(moves)))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            moves.append({"from": src, "to": dst})
+
+    move(rec["_file"])
+    if rec.get("cwd"):
+        proj = project_dir(p["cfg"], rec["cwd"])
+        for cli in cli_ids(rec):
+            move(os.path.join(proj, cli + ".jsonl"))
+            move(os.path.join(proj, cli))
+            move(os.path.join(p["cfg"], "file-history", cli))
+    move(os.path.join(p["data"], "side-session-notes", rec["sessionId"]))
+    set_archived_idx(sess, rec["sessionId"], False)
+
+    # The tombstone Claude writes when you delete a chat: keeps its session recovery
+    # from bringing the transcript back
+    tombstones = []
+    for cli in cli_ids(rec):
+        t = os.path.join(sess, f"deleted_{cli}")
+        if not os.path.exists(t):
+            with open(t, "w") as f:
+                f.write(str(int(time.time() * 1000)))
+            tombstones.append(t)
+
+    write_json(os.path.join(entry, "manifest.json"), {
+        "profile": key, "sessionId": rec["sessionId"], "title": rec.get("title"),
+        "removedAt": int(time.time() * 1000), "moves": moves, "tombstones": tombstones,
+    })
+    return entry
+
+
+def trash_entries():
+    out = []
+    for m in sorted(glob.glob(os.path.join(TRASH_DIR, "*", "manifest.json")), reverse=True):
+        d = read_json(m)
+        if d:
+            d["id"] = os.path.basename(os.path.dirname(m))
+            out.append(d)
+    return out
+
+
+def restore(entry_id):
+    # An entry id is a folder name made by trash_chat: never a path
+    if not entry_id or entry_id.startswith(".") or os.sep in entry_id:
+        die(f"no trash entry '{entry_id}'")
+    entry = os.path.join(TRASH_DIR, entry_id)
+    man = read_json(os.path.join(entry, "manifest.json"))
+    if not man:
+        die(f"no trash entry '{entry_id}'")
+    if man["profile"] in PROFILES and app_running(man["profile"]):
+        die(f"the Claude app of profile {man['profile']} is open: quit it (Cmd+Q) and try again", EXIT_APP_OPEN)
+    clashes = [m["from"] for m in man["moves"] if os.path.exists(m["from"])]
+    if clashes:
+        die("these paths exist again, restore would overwrite them: " + ", ".join(clashes))
+    for m in man["moves"]:
+        os.makedirs(os.path.dirname(m["from"]), exist_ok=True)
+        shutil.move(m["to"], m["from"])
+    for t in man.get("tombstones", []):
+        if os.path.exists(t):
+            os.remove(t)
+    shutil.rmtree(entry)  # only our own, now empty, bookkeeping folder
+    return man
+
+
+# ---------------------------------------------------------------- copying
+
+def plan_state(rec, src, dst):
+    """What copying this chat does: new, same, newer, older, diverged, nosource."""
+    s, d = transcript(src, rec), transcript(dst, rec)
+    if not s or not os.path.exists(s):
+        return "nosource"
+    if not os.path.exists(d):
+        return "new"
+    return compare(s, d)
+
+
+def copy_tree(src, dst):
+    if os.path.isdir(src):
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def copy_chat(rec, src, dst, state):
+    cwd = rec["cwd"]
+    sp, dp = PROFILES[src], PROFILES[dst]
+    sproj, dproj = project_dir(sp["cfg"], cwd), project_dir(dp["cfg"], cwd)
+    os.makedirs(dproj, exist_ok=True)
+    for i, cli in enumerate(cli_ids(rec)):
+        sj, dj = os.path.join(sproj, cli + ".jsonl"), os.path.join(dproj, cli + ".jsonl")
+        if not os.path.exists(sj):
+            continue
+        if i == 0:
+            if state == "diverged" and os.path.exists(dj):
+                shutil.copy2(dj, f"{dj}.bak-{TS}")
+            if state in ("new", "newer", "diverged"):
+                shutil.copy2(sj, dj)
+        elif not os.path.exists(dj) or os.path.getsize(sj) > os.path.getsize(dj):
+            shutil.copy2(sj, dj)  # earlier transcripts of the same chat
+        copy_tree(os.path.join(sproj, cli), os.path.join(dproj, cli))
+        copy_tree(os.path.join(sp["cfg"], "file-history", cli), os.path.join(dp["cfg"], "file-history", cli))
+    copy_tree(os.path.join(sp["data"], "side-session-notes", rec["sessionId"]),
+              os.path.join(dp["data"], "side-session-notes", rec["sessionId"]))
+
+    # The card in the destination app's Code tab
+    dsess = sessions_dir(dst)
+    out = os.path.join(dsess, os.path.basename(rec["_file"]))
+    body = json.dumps({k: v for k, v in rec.items() if k != "_file" and k not in DROP_KEYS})
+    a = json.dumps(sp["data"] + "/side-session-notes/")[1:-1]
+    b = json.dumps(dp["data"] + "/side-session-notes/")[1:-1]
+    new = json.loads(body.replace(a, b))
+    old = read_json(out)
+    if old is not None:
+        for k in DROP_KEYS:  # keep the destination's own references and archive state
+            if k in old:
+                new[k] = old[k]
+        new["isArchived"] = bool(old.get("isArchived"))
+    else:
+        new["isArchived"] = False
+        set_archived_idx(dsess, rec["sessionId"], False)
+    write_json(out, new)
+
+
+def cmd_copy(a):
+    if a.src == a.dst:
+        die("source and destination are the same profile")
+    profile(a.src), profile(a.dst)
+    if a.move and a.archive_source:
+        die("use either --move or --archive-source")
+    apply_pending()
+    if not a.dry_run and app_running(a.dst):
+        die(f"the Claude app of profile {a.dst} is open: quit it (Cmd+Q) and try again", EXIT_APP_OPEN)
+    records = load_records(a.src)
+    root = find(records, a.chat)
+    group = [(root, 0)] if a.solo else family(records, root)
+
+    # Weigh the whole group first, then copy: never half a group
+    states = [(r, depth, plan_state(r, a.src, a.dst)) for r, depth in group]
+    diverged = [r for r, _, st in states if st == "diverged"]
+    if diverged and not a.force:
+        die("continued in both profiles, the versions differ: "
+            + "; ".join(f"«{r.get('title')}»" for r in diverged)
+            + f". With --force the {a.dst} versions are kept as .bak-{TS} and replaced.", EXIT_DIVERGED)
+    if all(st in ("older", "nosource") for _, _, st in states) and any(st == "older" for _, _, st in states):
+        die(f"the copy in {a.dst} is further along: did you mean --from {a.dst} --to {a.src}?", EXIT_DEST_AHEAD)
+
+    src_open = app_running(a.src)
+    results = []
+    for r, depth, st in states:
+        after = None
+        copied = st in ("new", "newer", "diverged", "same")
+        if copied and not a.dry_run:
+            copy_chat(r, a.src, a.dst, st)
+        if copied and (a.move or a.archive_source):
+            action = "remove" if a.move else "archive"
+            if src_open:
+                after = f"{action}-pending"
+                if not a.dry_run:
+                    queue(action, a.src, r, a.dst)
+            elif a.dry_run:
+                after = "removed" if a.move else "archived"
+            elif a.move:
+                after = "removed" if synced_with(r, a.src, a.dst) and trash_chat(a.src, r) else "kept"
+            else:
+                archive_now(a.src, r)
+                after = "archived"
+        results.append({"sessionId": r["sessionId"], "title": r.get("title"), "depth": depth,
+                        "state": st, "after": after})
+
+    if a.json:
+        json.dump({"from": a.src, "to": a.dst, "dryRun": a.dry_run, "chats": results}, sys.stdout)
+        return
+    label = {"new": "copied", "newer": "updated", "same": "already identical", "diverged": "replaced (backup kept)",
+             "older": "SKIPPED: further along in the destination", "nosource": "SKIPPED: no saved conversation"}
+    after_label = {"archived": "archived in source", "removed": "removed from source (in trash)",
+                   "kept": "NOT removed: copy differs", "archive-pending": "will be archived when the source app quits",
+                   "remove-pending": "will be removed when the source app quits"}
+    head = f"«{root.get('title')}»" + (f" with {len(group) - 1} sub-chats" if len(group) > 1 else "")
+    print(f"{head}: {a.src} -> {a.dst}" + ("  (dry run, nothing changed)" if a.dry_run else ""))
+    for x in results:
+        line = "  " + "  " * x["depth"] + ("↳ " if x["depth"] else "") + f"{x['title']}: {label[x['state']]}"
+        if x["after"]:
+            line += f", {after_label[x['after']]}"
+        print(line)
+
+
+# ---------------------------------------------------------------- listing
+
+def chat_json(key, r, idx, pending, sync=None, peer=None):
+    return {
+        "id": r["sessionId"][6:14], "sessionId": r["sessionId"], "title": r.get("title") or "(untitled)",
+        "cwd": (r.get("cwd") or "").replace(HOME, "~"), "project": project_of(r.get("cwd") or "").replace(HOME, "~"),
+        "lastActivityAt": r.get("lastActivityAt") or 0, "archived": is_archived(r, idx),
+        "pending": pending.get(r["sessionId"]), "parent": parent_of(r), "sync": sync,
+        "peerSessionId": peer["sessionId"] if peer else None,
+    }
+
+
+def profile_json(key):
+    p = PROFILES[key]
+    d = {"key": key, "name": p["name"], "color": p["color"], "running": app_running(key)}
+    d.update(account_info(key))
+    return d
+
+
+def cmd_profiles(a):
+    apply_pending()
+    out = [profile_json(k) for k in PROFILES]
+    if a.json:
+        json.dump(out, sys.stdout)
+        return
+    for p in out:
+        who = p["email"] or (p["account"] or "not signed in")[:8]
+        print(f"{p['key']:<12} {p['name']:<12} {'open ' if p['running'] else 'closed'}  {who}"
+              + ("  (Desktop and Code use different accounts)" if p["accountMismatch"] else ""))
+
+
+def cmd_list(a):
+    profile(a.src)
+    apply_pending()
+    records = load_records(a.src)
+    idx = read_idx(sessions_dir(a.src))
+    pending = {it["sessionId"]: it["action"] for it in load_pending() if it["profile"] == a.src}
+    q = (a.query or "").lower()
+    rows = [r for r in records if not q or q in (r.get("title") or "").lower() or q in (r.get("cwd") or "").lower()]
+    if a.json:
+        json.dump([chat_json(a.src, r, idx, pending) for r in rows], sys.stdout)
+        return
+    for r in rows:
+        flag = "A" if is_archived(r, idx) else ("p" if r["sessionId"] in pending else " ")
+        when = time.strftime("%d/%m %H:%M", time.localtime((r.get("lastActivityAt") or 0) / 1000))
+        print(f"{r['sessionId'][6:14]} {flag} {when}  {(r.get('title') or '')[:60]:<60}  {(r.get('cwd') or '').replace(HOME, '~')}")
+    print("\n(A = archived, p = archive/removal queued until the app quits)")
+
+
+MAX_SHOWN = 3
+
+
+def shown_profiles():
+    """The profiles to compare: the ones picked in config.json (at most 3), else the first 3 found."""
+    picked = [k for k in (read_json(CONFIG_FILE, {}) or {}).get("show", []) if k in PROFILES]
+    return (picked or list(PROFILES))[:MAX_SHOWN]
+
+
+def relate(paths):
+    """Compare one chat's transcripts across profiles: {key: same|latest|behind|diverged|missing}."""
+    present = {k: p for k, p in paths.items() if p and os.path.exists(p)}
+    out = {k: "missing" for k in paths if k not in present}
+    if not present:
+        return out
+    head = max(present, key=lambda k: os.path.getsize(present[k]))
+    rel = {k: compare(present[head], present[k], _cache) for k in present}
+    if any(r == "diverged" for r in rel.values()):
+        out.update({k: "diverged" for k in present})
+    elif all(r == "same" for r in rel.values()):
+        out.update({k: "same" for k in present})
+    else:
+        out.update({k: ("latest" if rel[k] == "same" else "behind") for k in present})
+    return out
+
+
+_cache = {}
+
+
+def cmd_status(a):
+    global _cache
+    keys = a.profiles.split(",") if a.profiles else shown_profiles()
+    for k in keys:
+        profile(k)
+    apply_pending()
+    _cache = read_json(COMPARE_CACHE, {}) or {}
+    pending = load_pending()
+    out = {"profiles": [], "chats": []}
+    snaps = {}
+    for k in keys:
+        info = profile_json(k)
+        try:
+            snaps[k] = (load_records(k), read_idx(sessions_dir(k)))
+        except ToolError as e:
+            info["error"] = e.msg
+        out["profiles"].append(info)
+
+    # One row per chat, matched across profiles by session id (copies keep it), else by transcript id
+    rows, by_sid, by_cli = [], {}, {}
+    for k, (recs, idx) in snaps.items():
+        for r in recs:
+            row = by_sid.get(r["sessionId"]) or by_cli.get(r.get("cliSessionId"))
+            if row is None or k in row["recs"]:
+                row = {"recs": {}, "idx": {}}
+                rows.append(row)
+            row["recs"][k] = r
+            row["idx"][k] = idx
+            by_sid.setdefault(r["sessionId"], row)
+            if r.get("cliSessionId"):
+                by_cli.setdefault(r["cliSessionId"], row)
+
+    alias = {}
+    for row in rows:
+        row["key"] = next(iter(row["recs"].values()))["sessionId"]
+        for r in row["recs"].values():
+            alias[r["sessionId"]] = row["key"]
+    for row in rows:
+        recs = row["recs"]
+        newest = max(recs.values(), key=lambda r: r.get("lastActivityAt") or 0)
+        rel = relate({k: transcript(k, r) for k, r in recs.items()}) if len(recs) > 1 else {}
+        parent = next((alias.get(parent_of(r)) for r in recs.values() if parent_of(r) in alias), None)
+        sides = {}
+        for k, r in recs.items():
+            mine = {it["sessionId"]: it["action"] for it in pending if it["profile"] == k}
+            sides[k] = {"sessionId": r["sessionId"], "archived": is_archived(r, row["idx"][k]),
+                        "pending": mine.get(r["sessionId"]), "lastActivityAt": r.get("lastActivityAt") or 0,
+                        "state": rel.get(k, "only")}
+        out["chats"].append({
+            "key": row["key"], "title": newest.get("title") or "(untitled)",
+            "cwd": (newest.get("cwd") or "").replace(HOME, "~"),
+            "project": project_of(newest.get("cwd") or "").replace(HOME, "~"),
+            "lastActivityAt": newest.get("lastActivityAt") or 0,
+            "parent": parent if parent != row["key"] else None, "sides": sides,
+        })
+    write_json(COMPARE_CACHE, _cache)
+    if a.json:
+        json.dump(out, sys.stdout)
+        return
+    for p in out["profiles"]:
+        print(f"== {p['key']}" + (f": {p['error']}" if "error" in p else ""))
+    counts = {}
+    for c in out["chats"]:
+        states = {s["state"] for s in c["sides"].values()}
+        kind = ("only in " + next(iter(c["sides"]))) if states == {"only"} else \
+            "in sync" if states == {"same"} else "diverged" if "diverged" in states else "to update"
+        counts[kind] = counts.get(kind, 0) + 1
+    for kind, n in sorted(counts.items()):
+        print(f"   {kind}: {n}")
+
+
+def cmd_trash(a):
+    if a.trash_cmd == "restore":
+        man = restore(a.entry)
+        print(f"Restored «{man.get('title')}» in {man['profile']}.")
+        return
+    entries = trash_entries()
+    if a.json:
+        json.dump([{k: e.get(k) for k in ("id", "profile", "sessionId", "title", "removedAt")} for e in entries], sys.stdout)
+        return
+    for e in entries:
+        when = time.strftime("%d/%m %H:%M", time.localtime(e["removedAt"] / 1000))
+        print(f"{e['id']}  {when}  {e['profile']:<10} {e.get('title')}")
+    if not entries:
+        print("Trash is empty.")
+
+
+def cmd_pending(a):
+    if a.pending_cmd == "cancel":
+        save_pending([it for it in load_pending() if it["sessionId"] != a.session_id])
+        return
+    items = load_pending()
+    if a.json:
+        json.dump(items, sys.stdout)
+        return
+    for it in items:
+        print(f"{it['action']:<8} {it['profile']:<10} {it.get('title')}")
+    if not items:
+        print("Nothing queued.")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="claude-chat", description=__doc__.split("\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    pr = sub.add_parser("profiles", help="list the profiles and their accounts")
+    pr.add_argument("--json", action="store_true")
+    l = sub.add_parser("list", help="list the chats of a profile")
+    l.add_argument("--from", dest="src", required=True)
+    l.add_argument("query", nargs="?")
+    l.add_argument("--json", action="store_true")
+    st = sub.add_parser("status", help="compare the chats of the shown profiles (at most 3)")
+    st.add_argument("--profiles", help="comma-separated profile keys (default: config.json \"show\", else the first 3)")
+    st.add_argument("--json", action="store_true")
+    c = sub.add_parser("copy", help="copy or move a chat and its sub-chats to another profile")
+    c.add_argument("chat", help="ID (or part of it) or part of the title")
+    c.add_argument("--from", dest="src", required=True)
+    c.add_argument("--to", dest="dst", required=True)
+    c.add_argument("--move", action="store_true", help="then remove it from the source (recoverable from the trash)")
+    c.add_argument("--archive-source", action="store_true", help="then archive it in the source")
+    c.add_argument("--solo", action="store_true", help="only this chat, without its sub-chats")
+    c.add_argument("--force", action="store_true", help="replace diverged versions in the destination (backup kept)")
+    c.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    c.add_argument("--json", action="store_true")
+    t = sub.add_parser("trash", help="chats removed by --move")
+    tsub = t.add_subparsers(dest="trash_cmd", required=True)
+    tl = tsub.add_parser("list")
+    tl.add_argument("--json", action="store_true")
+    tr = tsub.add_parser("restore")
+    tr.add_argument("entry")
+    pe = sub.add_parser("pending", help="archives and removals waiting for an app to quit")
+    psub = pe.add_subparsers(dest="pending_cmd", required=True)
+    pl = psub.add_parser("list")
+    pl.add_argument("--json", action="store_true")
+    pc = psub.add_parser("cancel")
+    pc.add_argument("session_id")
+    a = p.parse_args()
+    try:
+        {"profiles": cmd_profiles, "list": cmd_list, "status": cmd_status, "copy": cmd_copy,
+         "trash": cmd_trash, "pending": cmd_pending}[a.cmd](a)
+    except ToolError as e:
+        print(f"ERROR: {e.msg}", file=sys.stderr)
+        sys.exit(e.code)
+
+
+if __name__ == "__main__":
+    main()
