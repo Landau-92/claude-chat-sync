@@ -5,6 +5,10 @@
 profiles, a chat sometimes starts in the wrong one. Claude Chat Sync shows the Code chats of up to three
 profiles side by side and copies or moves a chat, with all its sub-chats, from one profile to another.
 
+![Claude Chat Sync comparing three profiles, with a group of chats selected](docs/screenshot.png)
+
+<sub>Screenshot made with made-up profiles and chats: `python3 tools/demo_home.py <folder>` builds them.</sub>
+
 > **Unofficial.** Not affiliated with Anthropic or with claude-multiprofile. It reads and writes Claude's
 > internal, undocumented files. Keep backups, and expect to update it when Claude changes those files.
 
@@ -148,6 +152,8 @@ writes the Keychain, never contacts the network, and never touches a profile's s
 ```bash
 python3 -m unittest discover tests   # end-to-end tests on fake profiles in a temporary HOME
 zsh app/build.sh                     # builds build/Claude Chat Sync.app
+python3 tools/demo_home.py /tmp/demo # fake profiles and chats, to try the app safely:
+HOME=/tmp/demo CLAUDE_CHAT_PS_OUTPUT="" "build/Claude Chat Sync.app/Contents/MacOS/ClaudeChatSync"
 ```
 
 The app is one SwiftUI file (`app/main.swift`); the command is one Python file (`bin/claude-chat`) using only

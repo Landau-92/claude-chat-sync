@@ -229,6 +229,7 @@ func source(for root: Item, group: [Item], target: String, among profiles: [Prof
 
 let dateFormatter: DateFormatter = {
     let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")  // the app is in English
     f.dateFormat = "d MMM HH:mm"
     return f
 }()
@@ -1029,6 +1030,7 @@ struct ClaudeChatSyncApp: App {
         WindowGroup("Claude Chat Sync") {
             ContentView()
         }
+        .defaultSize(width: 1240, height: 880)
         .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified)
     }
