@@ -38,7 +38,7 @@ earlier transcripts.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/claude-chat-sync.git
+git clone https://github.com/Landau-92/claude-chat-sync.git
 cd claude-chat-sync
 ./install.sh
 ```
