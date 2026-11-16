@@ -38,7 +38,9 @@ TRASH_DIR = os.path.join(DATA_DIR, "trash")
 COMPARE_CACHE = os.path.join(HOME, ".cache/claude-chat-sync/compare.json")
 
 # Fields that point at the source account or app instance: never copied across
-DROP_KEYS = ("bridgeSessionIds", "chromeTabGroupId", "remoteMcpServersConfig")
+# Per-account references that must not follow a chat to another profile. publishedArtifacts makes
+# Claude watch those artifacts' comments, which another organization's account can't do.
+DROP_KEYS = ("bridgeSessionIds", "chromeTabGroupId", "remoteMcpServersConfig", "publishedArtifacts")
 TS = time.strftime("%Y%m%d-%H%M%S")
 
 # Exit codes read by the app

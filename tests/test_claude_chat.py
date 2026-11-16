@@ -130,6 +130,15 @@ class ClaudeChatTest(unittest.TestCase):
         r = self.h.run("copy", "Parent", "--from", "default", "--to", "work")
         self.assertEqual(r.returncode, 0)
 
+    def test_published_artifacts_stay_with_their_account(self):
+        arts = [{"url": "https://claude.ai/artifact/abc", "title": "Page"}]
+        self.h.chat("default", "local_A", "cA", "Art", "a\n", publishedArtifacts=arts)
+        self.h.run("copy", "Art", "--from", "default", "--to", "work")
+        with open(os.path.join(self.h.sessions("work"), "local_A.json")) as f:
+            self.assertNotIn("publishedArtifacts", json.load(f))
+        with open(os.path.join(self.h.sessions("default"), "local_A.json")) as f:
+            self.assertEqual(json.load(f)["publishedArtifacts"], arts)
+
     def test_move_trashes_source_and_restore_brings_it_back(self):
         self.family()
         r = self.h.json("copy", "Parent", "--from", "default", "--to", "work", "--move")
