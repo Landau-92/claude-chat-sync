@@ -282,6 +282,9 @@ final class Store: ObservableObject {
     }
 
     func copy(_ req: CopyRequest, force: Bool = false) async {
+        // One copy at a time: a second click (or a Try Again fired while a copy is still running)
+        // used to start another copy, and each one queued its own alert.
+        guard !busy else { return }
         busy = true
         defer { busy = false }
         var args = ["copy", req.sourceSessionId, "--from", req.from.key, "--to", req.to.key, "--json"]
@@ -316,6 +319,17 @@ final class Store: ObservableObject {
             "\(c.title ?? "Chat"): \(state[c.state] ?? c.state)" + (c.after.flatMap { after[$0] }.map { ", \($0)" } ?? "")
         }
         return lines.joined(separator: "\n") + "\n\nOpen \(req.to.app) to see the result."
+    }
+
+    /// Run a follow-up action from an alert button only after SwiftUI has finished dismissing that
+    /// alert. Setting `dialog` again while the old alert is still going away (same id) made SwiftUI
+    /// present it over and over.
+    func afterAlert(_ action: @escaping @MainActor () async -> Void) {
+        dialog = nil
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            await action()
+        }
     }
 
     func cancelPending(_ sessionId: String) async {
@@ -1008,7 +1022,7 @@ struct ContentView: View {
         case .appOpen(let r):
             return Alert(title: Text("Quit \(r.to.app) first"),
                          message: Text("\(r.to.app) is open. Quit it (Cmd+Q in its window), then press Try Again."),
-                         primaryButton: .default(Text("Try Again")) { Task { await store.copy(r) } },
+                         primaryButton: .default(Text("Try Again")) { store.afterAlert { await store.copy(r) } },
                          secondaryButton: .cancel())
         case .diverged(let r, let detail):
             return Alert(title: Text("Some chats were continued in both profiles"),
@@ -1016,7 +1030,7 @@ struct ContentView: View {
                                        + "Replace the \(r.to.name) versions with the \(r.from.name) ones? "
                                        + "The current \(r.to.name) versions are kept as backups. "
                                        + "Until you confirm, nothing in the group is touched."),
-                         primaryButton: .destructive(Text("Replace")) { Task { await store.copy(r, force: true) } },
+                         primaryButton: .destructive(Text("Replace")) { store.afterAlert { await store.copy(r, force: true) } },
                          secondaryButton: .cancel())
         case .message(let t, let m):
             return Alert(title: Text(t), message: Text(m), dismissButton: .default(Text("OK")))

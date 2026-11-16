@@ -25,7 +25,7 @@ next claude-chat command). Removed chats go to a trash folder and can be restore
 These are internal, undocumented Claude formats: keep backups, and expect to update
 this tool when Claude changes them.
 """
-import argparse, glob, json, os, shutil, subprocess, sys, time
+import argparse, glob, json, os, re, shutil, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 SUPPORT = os.path.join(HOME, "Library/Application Support")
@@ -125,11 +125,16 @@ def app_running(key):
                      subprocess.run(["ps", "-axww", "-o", "args="], capture_output=True, text=True).stdout).splitlines()
     udd = PROFILES[key]["udd"]
     for line in _ps_cache:
-        if "/Contents/MacOS/Claude" not in line or "--type=" in line:
+        # Only the Claude Desktop main executable itself: ".app/Contents/MacOS/Claude" followed by
+        # its arguments. A bare substring test also matched other apps whose binary starts with
+        # "Claude" (this app's own ".../MacOS/ClaudeChatSync"), so Default always looked open.
+        m = re.search(r"\.app/Contents/MacOS/Claude(?=\s|$)", line)
+        if not m or "--type=" in line:
             continue
-        if udd is None and "--user-data-dir=" not in line:
+        found = re.search(r"--user-data-dir=(.+?)(?=\s--|$)", line[m.end():])
+        if udd is None and not found:
             return True
-        if udd is not None and f"--user-data-dir={udd}" in line:
+        if udd is not None and found and os.path.normpath(found.group(1).strip().strip('"')) == os.path.normpath(udd):
             return True
     return False
 

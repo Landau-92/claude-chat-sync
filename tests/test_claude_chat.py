@@ -34,6 +34,7 @@ class Home:
             account_json = os.path.join(self.root, ".claude.json") if name == "default" else os.path.join(cfg, ".claude.json")
             self.write_abs(account_json, {"oauthAccount": {"accountUuid": acct, "emailAddress": f"{name}@example.com"}})
         self.open_apps = set()
+        self.extra_ps = []  # other process lines to pretend are running
 
     def write(self, rel, data):
         self.write_abs(os.path.join(self.root, rel), data)
@@ -60,6 +61,7 @@ class Home:
     def run(self, *args, ok=True):
         ps = "\n".join(APP if n == "default" else f"{APP} --user-data-dir={self.profiles[n][0]}"
                        for n in self.open_apps)
+        ps = "\n".join([ps, *self.extra_ps])
         env = dict(os.environ, HOME=self.root, CLAUDE_CHAT_PS_OUTPUT=ps)
         r = subprocess.run(["/usr/bin/python3", "-I", TOOL, *args], capture_output=True, text=True, env=env)
         if ok and r.returncode != 0:
@@ -115,6 +117,18 @@ class ClaudeChatTest(unittest.TestCase):
         self.h.open_apps = {"work"}
         r = self.h.run("copy", "Parent", "--from", "default", "--to", "work", ok=False)
         self.assertEqual(r.returncode, 3)
+
+    def test_other_claude_named_processes_are_not_the_desktop_app(self):
+        self.family()
+        self.h.extra_ps = [
+            "/Users/me/Applications/Claude Chat Sync.app/Contents/MacOS/ClaudeChatSync",
+            "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu",
+            f"{APP} --user-data-dir={self.h.profiles['work'][0]}-old",
+        ]
+        r = self.h.json("profiles")
+        self.assertFalse(any(p["running"] for p in r), r)
+        r = self.h.run("copy", "Parent", "--from", "default", "--to", "work")
+        self.assertEqual(r.returncode, 0)
 
     def test_move_trashes_source_and_restore_brings_it_back(self):
         self.family()
